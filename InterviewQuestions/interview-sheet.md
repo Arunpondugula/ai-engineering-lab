@@ -886,3 +886,129 @@ On this project, one boundary case was missing, so a whole validation rule (hour
 ---
 
 </details>
+
+<details>
+<summary><b>Day 04 — NumPy + Pandas</b></summary>
+
+Levels: 🟢 basic · 🟡 common · 🔴 deeper follow-up
+
+### NumPy
+
+**🟢 Why is a NumPy array faster and smaller than a Python list?**
+
+A Python list doesn't hold the numbers themselves. It holds pointers, and each pointer leads to a full Python int object (about 28 bytes) stored somewhere else in memory. Summing a list means following each pointer, checking the type, and unboxing the value, all in the Python interpreter.
+
+A NumPy array stores the raw values side by side in one block of memory, all with the same dtype. Because every element is the same size and type, NumPy can run a tight C loop straight through the block, often using SIMD instructions. On 10 million ints, I measured the list at 343 MB vs 76 MB for the array, and a Python loop was about 89 times slower than `arr.sum()`.
+
+The trade-off is that an array holds one type only, and its numbers have a fixed size, so they can overflow.
+
+---
+
+**🟢 What is a dtype, and how do you choose one?**
+
+The dtype is the type every element in the array shares, like int8, int16, int64 or float32. It decides how many bytes each element takes and what range of values it can hold.
+
+To choose one, I check the min and max the column can realistically reach, think about what math I'll do on it (sums and products get bigger than the inputs), and pick the smallest type that fits with headroom. For example, daily sales counts in the hundreds go in int16, not int8, because int8 stops at 127. On M5-shaped data, moving from the default int64 to a small int type saved 88% of the memory with nothing lost.
+
+---
+
+**🟡 What happens when a value doesn't fit its dtype?**
+
+It overflows and wraps around silently. There's no error. For example, `np.array([100], dtype=np.int8) * 2` gives −56, because 200 doesn't fit in int8's range of −128 to 127, so it wraps to 200 − 256.
+
+The subtle part is that reductions like `sum()` and `mean()` upcast small ints to a 64-bit accumulator by default, so they're safe, but element-wise math like `+` and `*` keeps the dtype and can wrap. The fix is to convert to a bigger type before the risky math, and in pipelines, to validate value ranges so tomorrow's data doesn't break a dtype chosen from today's max.
+
+---
+
+**🟡 What's the difference between a view and a copy in NumPy?**
+
+A view is a new array object that points to the same memory as the original. A copy has its own memory. Basic slicing like `x[2:6]` gives a view. Boolean masks like `x[x > 5]` and fancy indexing like `x[[0, 3]]` give copies.
+
+This matters for two reasons. If you modify a view, you modify the original, which can corrupt data you didn't mean to touch. And a small view of a huge array keeps the whole array in memory, because the buffer can't be freed while the view still points into it. When I need an independent array, I call `.copy()`.
+
+---
+
+**🟡 Explain `axis` in NumPy. What does `sales.sum(axis=1)` return for a (30490, 1941) items × days array?**
+
+The axis you pass is the one that disappears. I write the shape, cross out that axis, and what's left is the result's shape.
+
+For `(30490, 1941)`, `axis=1` removes the days, so the result is shape `(30490,)`: one total per item. `axis=0` removes the items and gives `(1941,)`: one total per day. A quick sanity check is to ask how many answers I expect. If I want one value per item, the result must have 30,490 values.
+
+---
+
+**🟡 What is broadcasting? Why does `units * prices[:, None]` work but `units * prices` fail?**
+
+Broadcasting lets NumPy combine arrays of different shapes without copying data. It compares shapes from the right, and two dimensions are compatible if they're equal or one of them is 1. A dimension of size 1 gets stretched virtually, with no extra memory.
+
+`units` is (1000, 1941) and `prices` is (1000,). Without `[:, None]`, prices lines up with the last axis, so NumPy compares 1000 with 1941 and fails. `prices[:, None]` reshapes it to (1000, 1), which matches the 1000 items and stretches across all 1941 days. Vectorized this way, my revenue calculation was about 188 times faster than nested loops.
+
+---
+
+**🔴 How much memory do 10 million 1536-dimension embeddings take, and how would you cut it?**
+
+Size is count × dimensions × bytes per value. In float32 that's 10M × 1536 × 4 bytes, about 61 GB. Storing them as float16 halves it to about 31 GB, usually with very little loss in search quality. Going further, you can reduce dimensions if the model supports it, or use binary quantization (1 bit per dimension), which is about 32 times smaller than float32. Then you rescore the top candidates with the full-precision vectors to recover accuracy.
+
+The right choice depends on measured recall vs memory, not on the size alone. *(I'll measure this trade-off for real in ShelfSense on Day 36.)*
+
+### Pandas
+
+**🟢 What are a Series and a DataFrame?**
+
+A Series is one column of data: a NumPy array of values plus an Index of labels. A DataFrame is a table made of Series that share the same Index, where each column keeps its own dtype. That's how a DataFrame can hold text, ints and floats together, which a single NumPy array can't.
+
+---
+
+**🟡 Why is a column operation like `df["d_1"].sum()` fast, while `iterrows()` is slow?**
+
+It comes down to how Pandas stores data. Each column is a separate contiguous array with one dtype, so a column operation is a single C loop over that array.
+
+A row cuts across every column, and those columns have different dtypes. To give you a row, `iterrows()` has to build a new Series object every time and convert each value into a Python object. On M5, that's over 30,000 Series objects built and thrown away, each pulling from 1,947 separate arrays. In practice I write logic as column operations, `np.where`, `map` or `groupby` instead of row loops.
+
+---
+
+**🟡 You add two Series and get NaNs, and an int column turns into float. What happened?**
+
+Pandas combines data by label, not by position. Any label that exists in one Series but not the other has no partner, so the result is NaN. And because classic int64 can't hold NaN, Pandas upcasts the whole result to float64.
+
+To catch it, I check `isna().sum()` after every combine or merge, and compare labels with `a.index.difference(b.index)`. In pipelines, those checks become assertions so a bad join fails loudly. `fill_value=0` fixes the NaNs only when missing really means zero. If it means "no data", filling with 0 gives a total that looks right but is wrong.
+
+---
+
+**🟡 What's the difference between `loc` and `iloc`, and why can `loc[0]` fail after a filter?**
+
+`loc` selects by label, and `iloc` selects by position. When you filter a DataFrame, the rows keep their original index labels. In my M5 data, filtering to CA food items gave a result whose labels started at 1612, so `loc[0]` raised a KeyError, while `iloc[0]` returned the first row. If I want clean 0..n labels, I use `reset_index(drop=True)`.
+
+---
+
+**🟡 What's wrong with `df[mask]["col"] = 0`, and what's the correct way?**
+
+That's chained assignment. `df[mask]` creates a temporary filtered table first, and the assignment writes into that temporary table, so the original `df` never changes. In Pandas 3 with copy-on-write, it never works and raises a `ChainedAssignmentError`.
+
+The correct way to change the original is one `.loc` call: `df.loc[mask, "col"] = 0`. If I want to modify a subset independently without touching the original, I make it explicit with `sub = df[mask].copy()` and then modify `sub`.
+
+---
+
+**🟡 How do you treat missing values? Is NaN always "unknown"?**
+
+No. Missing can mean two different things. *Unknown* means the value exists but wasn't recorded, like a customer's age. *Absent* means there's nothing to record. In M5's calendar, 1,807 of 1,969 days have no `event_name_1`, because there was no event on those days.
+
+They're handled differently. An absent value usually becomes a real value like "none" or a 0/1 flag when building features. An unknown value gets imputed or flagged, depending on whether the fact that it's missing carries information.
+
+---
+
+**🔴 A 2 GB CSV won't load on an 8 GB laptop. Why, and what do you do?**
+
+Two main reasons. First, Pandas often needs 5–10 times the file size in RAM during real work, because parsing text builds arrays plus temporary buffers, and many operations make copies. Second, the default dtypes are wasteful: every int becomes int64, every float becomes float64, and text is stored as full strings even when values repeat.
+
+My first step is to load a small sample with `nrows=` to see the columns and value ranges. Then I reload with `usecols=` to read only the columns I need, and `dtype=` to set small types and `category` at load time, so the big version never exists in memory. If it still doesn't fit, I read in `chunksize=` pieces, convert to Parquet once, or query it with DuckDB, which streams through files bigger than RAM.
+
+---
+
+**🔴 When would a team choose Polars, DuckDB or Spark over Pandas?**
+
+- **Pandas:** the data fits comfortably in memory, you're exploring in a notebook, or you need its ecosystem (scikit-learn, plotting).
+- **Polars:** the data fits on one machine but Pandas is too slow or memory-hungry. It's multi-threaded, Arrow-based, and has lazy evaluation, so it plans the whole query and reads only what's needed.
+- **DuckDB:** you want SQL directly on Parquet or CSV files, especially files bigger than RAM. It reads only the columns a query needs and streams through the data, so 50 GB of Parquet can be queried on a 16 GB laptop.
+- **Spark:** the data is too big for one machine (hundreds of GB to TBs) and needs a cluster.
+
+</details>
